@@ -5452,7 +5452,7 @@ def stream_responses_events(upstream, model, holder):
                         "output_index": out_idx,
                         "id": c_id,
                         "name": fn_name,
-                        "arguments": fn_args,
+                        "arguments": "",
                         "custom": is_custom,
                         "item_id": _new_id("ctc_" if is_custom else "fc_"),
                     }
@@ -5483,22 +5483,27 @@ def stream_responses_events(upstream, model, holder):
                         entry["name"] = fn_name
                         if fn_name in custom_names:
                             entry["custom"] = True
-                    if fn_args:
-                        entry["arguments"] += fn_args
-                        if entry.get("custom"):
-                            yield ev("response.custom_tool_call_input.delta", {
-                                "output_index": entry["output_index"],
-                                "item_id": entry["item_id"],
-                                "call_id": entry["id"],
-                                "delta": fn_args,
-                            })
-                        else:
-                            yield ev("response.function_call_arguments.delta", {
-                                "output_index": entry["output_index"],
-                                "item_id": entry["item_id"],
-                                "call_id": entry["id"],
-                                "delta": fn_args,
-                            })
+                # 第一個分片也要發 delta。規範裡 arguments 是客戶端按 delta 累加
+                # 出來的（output_item.added 上的 arguments 恆為空串），只把開頭
+                # 那一片存進 entry 不發事件的話，按 delta 還原呼叫的客戶端
+                # （Codex、以及 Claude Code 的 Responses 橋）拿到殘缺 JSON，
+                # 工具呼叫在解析階段就失敗。
+                if fn_args:
+                    entry["arguments"] += fn_args
+                    if entry.get("custom"):
+                        yield ev("response.custom_tool_call_input.delta", {
+                            "output_index": entry["output_index"],
+                            "item_id": entry["item_id"],
+                            "call_id": entry["id"],
+                            "delta": fn_args,
+                        })
+                    else:
+                        yield ev("response.function_call_arguments.delta", {
+                            "output_index": entry["output_index"],
+                            "item_id": entry["item_id"],
+                            "call_id": entry["id"],
+                            "delta": fn_args,
+                        })
             piece = delta.get("content")
             if piece:
                 if msg_index is None:
