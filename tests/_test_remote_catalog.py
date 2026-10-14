@@ -172,12 +172,13 @@ class RemoteCatalogTests(unittest.TestCase):
             "glm-5.3", "glm-5.2", "kimi-k3", "kimi-k2.6", "kimi-k2.8-preview"])
 
     def test_cn_keeps_the_pinned_free_variant(self):
+        # 实时 meta 为准：上游已下线 hy4-preview-f 且 hy4-preview 为收费 (0.29x) 时，如实对外宣告 hy4-preview
         P.fetch_remote_product_config = (
             lambda realm: (CN_IDS, CN_META) if realm == "cn" else None)
         ids = [m for m, _ in P.fetch_models("cn")]
-        self.assertEqual(ids[0], "hy4-preview-f")
-        self.assertIn("hy4-preview-f", ids)    # pin: free, remote no longer lists it
-        self.assertNotIn("hy4-preview", ids)   # paid sibling of the free one
+        self.assertEqual(ids[0], "hy4-preview")
+        self.assertIn("hy4-preview", ids)
+        self.assertNotIn("hy4-preview-f", ids)
         self.assertNotIn("hy3-x", ids)         # -x variant
         self.assertNotIn("auto", ids)          # auto-router alias
 
@@ -236,6 +237,49 @@ class RemoteCatalogTests(unittest.TestCase):
         self.assertEqual(item["reasoning_default_effort"], "high")
         self.assertTrue(any("bundled table" in m for m in logged), logged)
 
+    def test_bare_live_effort_keeps_the_model_selectable(self):
+        """Issue #170: a bare live `effort` is the default, not a pin.
+
+        The endpoint answers with {"effort": "high"} for deepseek-v4.1-flash
+        while the bundled table knows the level is selectable. Taking the live
+        block at face value dropped supportedEfforts, so /v1/models advertised
+        the model as pinned to high - and every request was recorded at high
+        even when the client sent max, the level it was really forwarded with.
+        """
+        meta = dict(INTL_META)
+        meta["deepseek-v4.1-flash"] = {
+            "credits": "x0.00",
+            "reasoning": {"effort": "high", "summary": "auto"},
+        }
+        logged = []
+        original_log = P.log
+        P.log = lambda message, **kw: logged.append(message)
+        try:
+            P.fetch_remote_product_config = (
+                lambda realm: (INTL_IDS, meta) if realm == "intl" else None)
+            P._catalog_fallback_log.pop("intl", None)
+            entries = dict(P.fetch_models("intl"))
+        finally:
+            P.log = original_log
+        item = P.model_entry("deepseek-v4.1-flash",
+                             entries["deepseek-v4.1-flash"])
+        self.assertEqual(item["reasoning_efforts"], ["low", "high", "max"])
+        self.assertEqual(item["reasoning_default_effort"], "high")
+        self.assertNotIn("reasoning_fixed_effort", item)
+        # The level the request really ran at follows the client again.
+        self.assertIsNone(P.model_fixed_effort("deepseek-v4.1-flash"))
+        self.assertEqual(
+            P.upstream_effort_of({"reasoning_effort": "max"},
+                                 "deepseek-v4.1-flash"),
+            "max")
+        # A model the live catalogue really does pin is untouched: no snapshot
+        # supportedEfforts to restore, so its bare effort still pins it.
+        pinned = P.model_entry("gemini-3.5-flash", entries["gemini-3.5-flash"])
+        self.assertEqual(pinned["reasoning_fixed_effort"], "medium")
+        self.assertNotIn("reasoning_efforts", pinned)
+        # And the shape is announced, not applied silently.
+        self.assertTrue(any("bundled table" in m for m in logged), logged)
+
     def test_parse_reads_the_desktop_cache_shape(self):
         """The cache file is the same document without the "data" envelope."""
         ids, _ = P.parse_remote_catalog(
@@ -249,17 +293,19 @@ class RemoteCatalogTests(unittest.TestCase):
     def test_cached_desktop_file_drives_the_list_without_the_endpoint(self):
         P.fetch_remote_product_config = lambda realm: None
         payload = {"agents": [{"name": "cli",
-                               "models": CN_IDS + ["new-model-9"]}],
-                   "models": [{"id": "hy3", "credits": "x0.00"}]}
+                               "models": CN_IDS + ["new-model-9", "uncredited-model"]}],
+                   "models": [{"id": "hy3", "credits": "x0.00"},
+                              {"id": "new-model-9", "credits": "x1.50"}]}
         path = os.path.join(_TMP, "acc-product-config-v3.json")
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(payload, fh)
         P.product_config_path = lambda realm: path
         P._models_cache["cn"] = {"at": 0.0, "data": None}
         ids = [m for m, _ in P.fetch_models("cn")]
-        self.assertEqual(ids[0], "hy4-preview-f")
+        self.assertEqual(ids[0], "hy4-preview")
         self.assertNotIn("auto", ids)
-        self.assertIn("new-model-9", ids)   # live-only name ships, no release
+        self.assertIn("new-model-9", ids)   # live-only name with credits ships, no release
+        self.assertNotIn("uncredited-model", ids)  # unpriced model is hidden until credits configured
 
 
 if __name__ == "__main__":
